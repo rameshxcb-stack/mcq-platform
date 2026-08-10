@@ -1,7 +1,5 @@
 // main.ts - Entry point for Deno Deploy
 
-import { handleRequest } from "./utils.ts";
-
 // CORS headers for cross-origin requests
 const corsHeaders = (request: Request) => {
   const origin = request.headers.get("origin") || "";
@@ -47,7 +45,6 @@ Deno.serve(async (req: Request) => {
         });
       }
 
-      // Import the getMCQs function dynamically
       const { getMCQs } = await import("./mcq-generator.ts");
       const data = await getMCQs(chapter);
 
