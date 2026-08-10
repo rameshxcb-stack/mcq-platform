@@ -1,7 +1,6 @@
 // main.ts - FINAL WORKING VERSION
 
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
-
 serve(async (req: Request) => {
   const url = new URL(req.url);
 
