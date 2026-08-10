@@ -1,6 +1,7 @@
 // main.ts
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
-import { createClient } from "https://esm.town/@turso/client";
+// ✅ सही Turso Client – यह Deno Deploy पर काम करेगा
+import { createClient } from "https://esm.sh/@libsql/client@0.7.0";
 import { generateAndStoreMCQs } from "./mcq-generator.ts";
 import {
   createSessionToken, verifySessionToken, hashIP, timingSafeEqual, hmac
@@ -71,7 +72,6 @@ function isOriginAllowed(origin: string): boolean {
 
 // ---------- DB query with timeout ----------
 async function dbQueryWithTimeout(sql: string, args: any[], timeoutMs = 5000) {
-  // Turso client does not support AbortSignal, so we wrap in Promise.race
   const queryPromise = db.execute({ sql, args });
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error("Database timeout")), timeoutMs)
@@ -111,7 +111,6 @@ async function handleRequest(req: Request): Promise<Response> {
     try { body = await req.json().catch(() => ({})); } catch { /* ignore */ }
     const userId = body.userId || "anon_" + crypto.randomUUID().slice(0, 8);
     const token = await createSessionToken(userId, JWT_SECRET);
-    // Store session in KV: key = sessionId, value = { userId, submitted: false }
     const sessionId = atob(token).split(':')[2];
     await kv.set(["session", sessionId], { userId, submitted: false }, { expireIn: 30 * 60 * 1000 });
     return new Response(JSON.stringify({ token, userId }), { headers });
@@ -142,9 +141,8 @@ async function handleRequest(req: Request): Promise<Response> {
         return new Response(JSON.stringify({ error: "Bundle not found" }), { status: 404, headers });
       }
       const row = result.rows[0];
-      const data = row.data as ArrayBuffer; // Turso returns BLOB as ArrayBuffer
+      const data = row.data as ArrayBuffer;
       const checksum = row.checksum as string;
-      // Optional integrity check: compute SHA-256 of uncompressed data? We'll trust it for now.
 
       const respHeaders = new Headers(headers);
       respHeaders.set("Content-Type", "application/json");
@@ -182,7 +180,6 @@ async function handleRequest(req: Request): Promise<Response> {
     if (!tokenData || tokenData.userId !== userId) {
       return new Response(JSON.stringify({ success: false, error: "Invalid token" }), { status: 403, headers });
     }
-    // Check session KV and mark as submitted (idempotent)
     const sessionEntry = await kv.get<{ userId: string; submitted: boolean }>(["session", tokenData.sessionId]);
     if (!sessionEntry.value) {
       return new Response(JSON.stringify({ success: false, error: "Session expired" }), { status: 403, headers });
@@ -192,7 +189,6 @@ async function handleRequest(req: Request): Promise<Response> {
     }
     await kv.set(["session", tokenData.sessionId], { ...sessionEntry.value, submitted: true }, { expireIn: 30 * 60 * 1000 });
 
-    // Store results (optional)
     console.log(JSON.stringify({ event: "submit", userId, chapter, count: answers.length, correlationId }));
     return new Response(JSON.stringify({ success: true, message: "Answers recorded" }), { headers });
   }
@@ -210,6 +206,66 @@ async function handleRequest(req: Request): Promise<Response> {
     try {
       const { rows: tasks } = await dbQueryWithTimeout(
         `SELECT * FROM generation_tasks WHERE status = 'pending' AND generated_count < target_count ORDER BY created_at ASC LIMIT 1`,
+        []
+      );
+      if (tasks.length === 0) {
+        return new Response(JSON.stringify({ message: "No pending tasks" }), { headers });
+      }
+      const task = tasks[0];
+      if (!(await tryLockTask(task.id))) {
+        return new Response(JSON.stringify({ message: "Task already being processed" }), { headers });
+      }
+      await db.execute({
+        sql: "UPDATE generation_tasks SET status = 'in_progress', updated_at = ? WHERE id = ?",
+        args: [Date.now(), task.id],
+      });
+      const batchSize = Math.min(100, task.target_count - task.generated_count);
+      let generated = 0;
+      try {
+        generated = await generateAndStoreMCQs(task.subject, task.chapter, batchSize);
+      } catch (err) {
+        await db.execute({
+          sql: `UPDATE generation_tasks SET status = 'pending', retry_count = retry_count + 1, last_error = ?, updated_at = ? WHERE id = ?`,
+          args: [err.message, Date.now(), task.id],
+        });
+        await unlockTask(task.id);
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers });
+      }
+      const newCount = task.generated_count + generated;
+      const newStatus = newCount >= task.target_count ? "completed" : "pending";
+      await db.execute({
+        sql: "UPDATE generation_tasks SET generated_count = ?, status = ?, updated_at = ? WHERE id = ?",
+        args: [newCount, newStatus, Date.now(), task.id],
+      });
+      await unlockTask(task.id);
+      console.log(JSON.stringify({ event: "generation_complete", taskId: task.id, generated }));
+      return new Response(JSON.stringify({ success: true, task_id: task.id, generated }), { headers });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: e.message }), { status: 500, headers });
+    }
+  }
+
+  // ---------- ADMIN: Cleanup old audit logs ----------
+  if (url.pathname === "/api/admin/cleanup-audit" && req.method === "POST") {
+    const adminKey = req.headers.get("x-admin-key") || "";
+    if (adminKey !== ADMIN_KEY) {
+      const qstashValid = await verifyQStashSignature(req);
+      if (!qstashValid) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 403, headers });
+      }
+    }
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    await db.execute({
+      sql: "DELETE FROM audit_log WHERE timestamp < ?",
+      args: [cutoff],
+    });
+    return new Response(JSON.stringify({ success: true, message: "Audit logs cleaned" }), { headers });
+  }
+
+  return new Response("Not Found", { status: 404, headers });
+}
+
+serve(handleRequest);ELECT * FROM generation_tasks WHERE status = 'pending' AND generated_count < target_count ORDER BY created_at ASC LIMIT 1`,
         []
       );
       if (tasks.length === 0) {
