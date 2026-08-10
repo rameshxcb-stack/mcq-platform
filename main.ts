@@ -1,6 +1,6 @@
 // main.ts
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
-// ✅ सही Turso Client – यह Deno Deploy पर काम करेगा
+// ✅ FIXED: सही Turso Client Library (esm.sh का उपयोग करके)
 import { createClient } from "https://esm.sh/@libsql/client@0.7.0";
 import { generateAndStoreMCQs } from "./mcq-generator.ts";
 import {
@@ -13,7 +13,7 @@ const TURSO_TOKEN = Deno.env.get("TURSO_AUTH_TOKEN")!;
 const ADMIN_KEY = Deno.env.get("ADMIN_API_KEY")!;
 const JWT_SECRET = Deno.env.get("JWT_SECRET")!;
 const QSTASH_SIGNING_SECRET = Deno.env.get("QSTASH_SIGNING_SECRET") || "";
-const ALLOWED_ORIGINS = Deno.env.get("ALLOWED_ORIGINS") || "*";  // comma-separated
+const ALLOWED_ORIGINS = Deno.env.get("ALLOWED_ORIGINS") || "*";
 const MAX_BODY_SIZE = 1_048_576;
 
 const db = createClient({ url: TURSO_URL, authToken: TURSO_TOKEN });
@@ -48,7 +48,7 @@ async function tryLockTask(taskId: number): Promise<boolean> {
 }
 async function unlockTask(taskId: number) { await kv.delete(["task_lock", taskId]); }
 
-// ---------- QStash Signature Verification (HMAC with signing secret) ----------
+// ---------- QStash Signature Verification ----------
 async function verifyQStashSignature(req: Request): Promise<boolean> {
   if (!QSTASH_SIGNING_SECRET) return false;
   const signature = req.headers.get("upstash-signature");
@@ -97,12 +97,12 @@ async function handleRequest(req: Request): Promise<Response> {
 
   if (req.method === "OPTIONS") return new Response(null, { headers });
 
-  // ---------- PUBLIC: Health (no sensitive data) ----------
+  // ---------- PUBLIC: Health ----------
   if (url.pathname === "/api/health") {
     return new Response(JSON.stringify({ status: "ok", timestamp: Date.now() }), { headers });
   }
 
-  // 🆕 ---------- PUBLIC: Get Session Token ----------
+  // ---------- PUBLIC: Get Session Token ----------
   if (url.pathname === "/api/session-token" && req.method === "POST") {
     if (!(await checkRateLimit(ip, 5, 60))) {
       return new Response(JSON.stringify({ error: "Too many token requests" }), { status: 429, headers });
@@ -116,7 +116,7 @@ async function handleRequest(req: Request): Promise<Response> {
     return new Response(JSON.stringify({ token, userId }), { headers });
   }
 
-  // ---------- PUBLIC: Protected Bundle (served from Turso) ----------
+  // ---------- PUBLIC: Protected Bundle ----------
   if (url.pathname.startsWith("/api/bundle/") && req.method === "GET") {
     if (!(await checkRateLimit(ip, 10, 60))) {
       return new Response(JSON.stringify({ error: "Rate limit exceeded" }), { status: 429, headers });
@@ -155,7 +155,7 @@ async function handleRequest(req: Request): Promise<Response> {
     }
   }
 
-  // ---------- PUBLIC: Submit Answers (single use per session) ----------
+  // ---------- PUBLIC: Submit Answers ----------
   if (url.pathname === "/api/submit" && req.method === "POST") {
     if (!(await checkRateLimit(ip, 30, 60))) {
       return new Response(JSON.stringify({ error: "Rate limit exceeded" }), { status: 429, headers });
@@ -193,7 +193,7 @@ async function handleRequest(req: Request): Promise<Response> {
     return new Response(JSON.stringify({ success: true, message: "Answers recorded" }), { headers });
   }
 
-  // ---------- ADMIN: Generate MCQs (QStash / Admin Key) ----------
+  // ---------- ADMIN: Generate MCQs ----------
   if (url.pathname === "/api/admin/generate" && req.method === "POST") {
     const adminKey = req.headers.get("x-admin-key") || "";
     if (adminKey !== ADMIN_KEY) {
@@ -245,7 +245,7 @@ async function handleRequest(req: Request): Promise<Response> {
     }
   }
 
-  // ---------- ADMIN: Cleanup old audit logs ----------
+  // ---------- ADMIN: Cleanup audit logs ----------
   if (url.pathname === "/api/admin/cleanup-audit" && req.method === "POST") {
     const adminKey = req.headers.get("x-admin-key") || "";
     if (adminKey !== ADMIN_KEY) {
@@ -255,66 +255,6 @@ async function handleRequest(req: Request): Promise<Response> {
       }
     }
     const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-    await db.execute({
-      sql: "DELETE FROM audit_log WHERE timestamp < ?",
-      args: [cutoff],
-    });
-    return new Response(JSON.stringify({ success: true, message: "Audit logs cleaned" }), { headers });
-  }
-
-  return new Response("Not Found", { status: 404, headers });
-}
-
-serve(handleRequest);ELECT * FROM generation_tasks WHERE status = 'pending' AND generated_count < target_count ORDER BY created_at ASC LIMIT 1`,
-        []
-      );
-      if (tasks.length === 0) {
-        return new Response(JSON.stringify({ message: "No pending tasks" }), { headers });
-      }
-      const task = tasks[0];
-      if (!(await tryLockTask(task.id))) {
-        return new Response(JSON.stringify({ message: "Task already being processed" }), { headers });
-      }
-      await db.execute({
-        sql: "UPDATE generation_tasks SET status = 'in_progress', updated_at = ? WHERE id = ?",
-        args: [Date.now(), task.id],
-      });
-      const batchSize = Math.min(100, task.target_count - task.generated_count);
-      let generated = 0;
-      try {
-        generated = await generateAndStoreMCQs(task.subject, task.chapter, batchSize);
-      } catch (err) {
-        await db.execute({
-          sql: `UPDATE generation_tasks SET status = 'pending', retry_count = retry_count + 1, last_error = ?, updated_at = ? WHERE id = ?`,
-          args: [err.message, Date.now(), task.id],
-        });
-        await unlockTask(task.id);
-        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers });
-      }
-      const newCount = task.generated_count + generated;
-      const newStatus = newCount >= task.target_count ? "completed" : "pending";
-      await db.execute({
-        sql: "UPDATE generation_tasks SET generated_count = ?, status = ?, updated_at = ? WHERE id = ?",
-        args: [newCount, newStatus, Date.now(), task.id],
-      });
-      await unlockTask(task.id);
-      console.log(JSON.stringify({ event: "generation_complete", taskId: task.id, generated }));
-      return new Response(JSON.stringify({ success: true, task_id: task.id, generated }), { headers });
-    } catch (e) {
-      return new Response(JSON.stringify({ error: e.message }), { status: 500, headers });
-    }
-  }
-
-  // ---------- ADMIN: Cleanup old audit logs ----------
-  if (url.pathname === "/api/admin/cleanup-audit" && req.method === "POST") {
-    const adminKey = req.headers.get("x-admin-key") || "";
-    if (adminKey !== ADMIN_KEY) {
-      const qstashValid = await verifyQStashSignature(req);
-      if (!qstashValid) {
-        return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 403, headers });
-      }
-    }
-    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30 days
     await db.execute({
       sql: "DELETE FROM audit_log WHERE timestamp < ?",
       args: [cutoff],
