@@ -248,6 +248,63 @@ async function handleRequest(req: Request): Promise<Response> {
     }
   }
 
+  // ---------- NEW: Direct Frontend Request Generation ----------
+  if (url.pathname === "/api/admin/start-generation" && req.method === "POST") {
+    const adminKey = req.headers.get("x-admin-key") || "";
+    if (adminKey !== ADMIN_KEY) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 403, headers });
+    }
+
+    try {
+      const body = await req.json();
+      const { subject, chapter, count } = body;
+      if (!subject || !chapter || !count) {
+        return new Response(JSON.stringify({ error: "Subject, chapter, and count required" }), { status: 400, headers });
+      }
+
+      // Insert task directly into DB
+      await db.execute({
+        sql: `INSERT INTO generation_tasks (subject, chapter, target_count, generated_count, status, created_at, updated_at)
+              VALUES (?, ?, ?, 0, 'pending', ?, ?)`,
+        args: [subject, chapter, count, Date.now(), Date.now()]
+      });
+
+      // Try to trigger generation immediately in background (Fire-and-Forget)
+      Promise.resolve().then(async () => {
+        try {
+          const { rows: tasks } = await dbQueryWithTimeout(
+            `SELECT * FROM generation_tasks WHERE status = 'pending' AND generated_count < target_count ORDER BY created_at ASC LIMIT 1`,
+            []
+          );
+          if (tasks.length > 0) {
+            const task = tasks[0];
+            if (await tryLockTask(task.id)) {
+              await db.execute({
+                sql: "UPDATE generation_tasks SET status = 'in_progress', updated_at = ? WHERE id = ?",
+                args: [Date.now(), task.id],
+              });
+              const generated = await generateAndStoreMCQs(task.subject, task.chapter, Math.min(100, task.target_count - task.generated_count));
+              const newCount = task.generated_count + generated;
+              const newStatus = newCount >= task.target_count ? "completed" : "pending";
+              await db.execute({
+                sql: "UPDATE generation_tasks SET generated_count = ?, status = ?, updated_at = ? WHERE id = ?",
+                args: [newCount, newStatus, Date.now(), task.id],
+              });
+              await unlockTask(task.id);
+              console.log(`✅ Manual generation complete: ${generated} MCQs`);
+            }
+          }
+        } catch (e) {
+          console.error("Manual trigger background error:", e);
+        }
+      });
+
+      return new Response(JSON.stringify({ success: true, message: "Generation started successfully!" }), { headers });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: e.message }), { status: 500, headers });
+    }
+  }
+
   // ---------- ADMIN: Cleanup old audit logs ----------
   if (url.pathname === "/api/admin/cleanup-audit" && req.method === "POST") {
     const adminKey = req.headers.get("x-admin-key") || "";
@@ -268,5 +325,20 @@ async function handleRequest(req: Request): Promise<Response> {
   return new Response("Not Found", { status: 404, headers });
 }
 
-// ✅ Deno.serve se server start
+// ✅ Auto-Scheduler (Every 5 Minutes) - No QStash needed!
+Deno.cron("Auto MCQ Gen", "*/5 * * * *", async () => {
+  console.log("⏰ Auto Cron triggered...");
+  try {
+    const res = await fetch("https://mcq-platform-80.rameshxcb-stack.deno.dev/api/admin/generate", {
+      method: "POST",
+      headers: { "x-admin-key": "mcq_admin_secure_key_2026_x9k2m4n8" }
+    });
+    const data = await res.json();
+    console.log("✅ Auto-gen result:", data);
+  } catch (e) {
+    console.error("❌ Auto-gen error:", e.message);
+  }
+});
+
+// 🔥 Deno.serve se server start
 Deno.serve(handleRequest);
