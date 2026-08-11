@@ -95,6 +95,14 @@ async function handleRequest(req: Request): Promise<Response> {
 
   if (req.method === "OPTIONS") return new Response(null, { headers });
 
+  // ---------- PUBLIC: Root (Homepage) ----------
+  if (url.pathname === "/" && req.method === "GET") {
+    return new Response("✅ MCQ Platform API is Live and Running!", { 
+      status: 200, 
+      headers 
+    });
+  }
+
   // ---------- PUBLIC: Health ----------
   if (url.pathname === "/api/health") {
     return new Response(JSON.stringify({ status: "ok", timestamp: Date.now() }), { headers });
@@ -260,4 +268,5 @@ async function handleRequest(req: Request): Promise<Response> {
   return new Response("Not Found", { status: 404, headers });
 }
 
+// ✅ Deno.serve se server start
 Deno.serve(handleRequest);
