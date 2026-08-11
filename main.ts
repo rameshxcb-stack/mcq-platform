@@ -1,4 +1,5 @@
 // main.ts
+// ✅ मूल esm.town वाला इम्पोर्ट वापस (जो आपको पहले काम कर रहा था)
 import { createClient } from "https://esm.town/@turso/client";
 import { generateAndStoreMCQs } from "./mcq-generator.ts";
 import {
@@ -184,7 +185,6 @@ async function handleRequest(req: Request): Promise<Response> {
     }
     await kv.set(["session", tokenData.sessionId], { ...sessionEntry.value, submitted: true }, { expireIn: 30 * 60 * 1000 });
 
-    // Store results (optional)
     console.log(JSON.stringify({ event: "submit", userId, chapter, count: answers.length, correlationId }));
     return new Response(JSON.stringify({ success: true, message: "Answers recorded" }), { headers });
   }
@@ -261,5 +261,5 @@ async function handleRequest(req: Request): Promise<Response> {
   return new Response("Not Found", { status: 404, headers });
 }
 
-// 🔥 बस इतना ही – Deno.serve बिना किसी port ऑप्शन के
+// ✅ असली फिक्स: बिना Port Option के Deno.serve
 Deno.serve(handleRequest);
