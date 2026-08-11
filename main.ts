@@ -325,15 +325,16 @@ async function handleRequest(req: Request): Promise<Response> {
   return new Response("Not Found", { status: 404, headers });
 }
 
-// ✅ Auto-Scheduler (Every 5 Minutes) - No QStash needed!
+// ✅ FINAL FIXED Auto-Scheduler (Network Call avoided)
 Deno.cron("Auto MCQ Gen", "*/5 * * * *", async () => {
-  console.log("⏰ Auto Cron triggered...");
+  console.log("⏰ Auto Cron triggered internally...");
   try {
-    const res = await fetch("https://mcq-platform-80.rameshxcb-stack.deno.dev/api/admin/generate", {
+    const fakeReq = new Request("https://mcq-platform-80.rameshxcb-stack.deno.dev/api/admin/generate", {
       method: "POST",
       headers: { "x-admin-key": "mcq_admin_secure_key_2026_x9k2m4n8" }
     });
-    const data = await res.json();
+    const response = await handleRequest(fakeReq);
+    const data = await response.json();
     console.log("✅ Auto-gen result:", data);
   } catch (e) {
     console.error("❌ Auto-gen error:", e.message);
