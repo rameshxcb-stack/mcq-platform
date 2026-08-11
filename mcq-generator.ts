@@ -1,5 +1,5 @@
 // mcq-generator.ts
-import { createClient } from "https://esm.town/@turso/client";
+import { createClient } from "npm:@libsql/client";
 import { normalizeMCQText, computeHash } from "./utils.ts";
 
 const db = createClient({
@@ -38,7 +38,6 @@ MCQs: ${JSON.stringify(mcqs)}`;
     return scores;
   } catch (err) {
     console.error("Rating via Gemini failed, trying DeepSeek:", err.message);
-    // Fallback to DeepSeek
     const key = getRandomKey("DEEPSEEK_KEYS");
     const url = "https://api.deepseek.com/v1/chat/completions";
     const controller = new AbortController();
@@ -67,7 +66,7 @@ MCQs: ${JSON.stringify(mcqs)}`;
   }
 }
 
-// ---------- Get high-quality examples (self‑learning) ----------
+// ---------- Get high-quality examples ----------
 async function getHighQualityExamples(subject: string, chapter: string): Promise<any[]> {
   const { rows } = await db.execute({
     sql: `SELECT question, option_a, option_b, option_c, option_d, answer, explanation
@@ -101,7 +100,7 @@ Each MCQ must follow this EXACT JSON structure (no extra text):
 Return ONLY a valid JSON array of objects.`;
 }
 
-// ---------- Random key selector ----------
+// ---------- Random key ----------
 function getRandomKey(envVar: string): string {
   const keys = (Deno.env.get(envVar) || "").split(",").filter(Boolean);
   if (keys.length === 0) throw new Error(`No keys for ${envVar}`);
@@ -187,13 +186,9 @@ export async function generateAndStoreMCQs(
   chapter: string,
   count: number
 ): Promise<number> {
-  // 1. Fetch high-quality examples (self‑learning)
   const examples = await getHighQualityExamples(subject, chapter);
-
-  // 2. Build prompt
   const prompt = buildGenerationPrompt(subject, chapter, count, examples);
 
-  // 3. Generate via AI (with fallback)
   let raw: any[] = [];
   try {
     raw = await callGemini(prompt);
@@ -206,16 +201,12 @@ export async function generateAndStoreMCQs(
     throw new Error("AI returned empty or invalid response");
   }
 
-  // 4. Quality validation
   const scores = await rateMCQsWithAI(raw, subject, chapter);
   const avgScore = scores.reduce((a, b) => a + b, 0) / scores.length;
   if (avgScore < 80) {
-    throw new Error(
-      `Batch quality too low (avg score: ${avgScore.toFixed(1)}). Entire batch rejected.`
-    );
+    throw new Error(`Batch quality too low (avg score: ${avgScore.toFixed(1)}). Entire batch rejected.`);
   }
 
-  // 5. Duplicate check (batch query to avoid N+1)
   const newHashes: string[] = [];
   const mcqMap = new Map<string, any>();
   for (const mcq of raw) {
@@ -231,7 +222,6 @@ export async function generateAndStoreMCQs(
   });
   const existingSet = new Set(existingRows.map(r => r.hash));
 
-  // 6. Insert only new MCQs
   let stored = 0;
   for (const hash of newHashes) {
     if (existingSet.has(hash)) continue;
@@ -255,6 +245,5 @@ export async function generateAndStoreMCQs(
     });
     stored++;
   }
-
   return stored;
-}
+    }
