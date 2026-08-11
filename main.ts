@@ -1,6 +1,5 @@
 // main.ts
-// ✅ मूल esm.town वाला इम्पोर्ट वापस (जो आपको पहले काम कर रहा था)
-import { createClient } from "https://esm.town/@turso/client";
+import { createClient } from "npm:@libsql/client";
 import { generateAndStoreMCQs } from "./mcq-generator.ts";
 import {
   createSessionToken, verifySessionToken, hashIP, timingSafeEqual, hmac
@@ -261,5 +260,4 @@ async function handleRequest(req: Request): Promise<Response> {
   return new Response("Not Found", { status: 404, headers });
 }
 
-// ✅ असली फिक्स: बिना Port Option के Deno.serve
 Deno.serve(handleRequest);
