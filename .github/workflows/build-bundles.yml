@@ -1,7 +1,7 @@
 name: Build Bundles
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 15 * * *'   # 🕒 Ye 3 PM (दोपहर 3 बजे) के लिए है
   workflow_dispatch:
 
 jobs:
