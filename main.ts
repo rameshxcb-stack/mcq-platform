@@ -1,118 +1,252 @@
-// main.ts - Final Version with Build Bundles API
-import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
-import { createClient } from "https://esm.sh/@libsql/client@0.7.0";
-import { generateMCQs, getMCQs } from "./mcq-generator.ts";
-import { getDb } from "./utils.ts";
+// main.ts - Final Working Version
+import { createClient } from "npm:@libsql/client";
+import { generateAndStoreMCQs } from "./mcq-generator.ts";
+import {
+  createSessionToken, verifySessionToken, hashIP, timingSafeEqual, hmac
+} from "./utils.ts";
+// ✅ Import your buildBundles function (works fine now)
 import { buildBundles } from "./scripts/build-bundles.ts";
 
 // ---------- Environment ----------
 const TURSO_URL = Deno.env.get("TURSO_DATABASE_URL")!;
 const TURSO_TOKEN = Deno.env.get("TURSO_AUTH_TOKEN")!;
 const ADMIN_KEY = Deno.env.get("ADMIN_API_KEY")!;
+const JWT_SECRET = Deno.env.get("JWT_SECRET")!;
+const QSTASH_SIGNING_SECRET = Deno.env.get("QSTASH_SIGNING_SECRET") || "";
 const ALLOWED_ORIGINS = Deno.env.get("ALLOWED_ORIGINS") || "*";
+const MAX_BODY_SIZE = 1_048_576;
 
 const db = createClient({ url: TURSO_URL, authToken: TURSO_TOKEN });
+const kv = await Deno.openKv();
 
-// ---------- CORS Headers ----------
-function corsHeaders(origin: string) {
-  return {
-    "Access-Control-Allow-Origin": ALLOWED_ORIGINS === "*" ? "*" : origin,
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, x-admin-key",
-  };
+// ---------- Helpers ----------
+async function logAudit(event: string, ip: string, details = "") {
+  const id = crypto.randomUUID();
+  const ipHashed = await hashIP(ip);
+  await db.execute({
+    sql: "INSERT INTO audit_log (id, event, ip_hash, details, timestamp) VALUES (?, ?, ?, ?, ?)",
+    args: [id, event, ipHashed, details, Date.now()],
+  }).catch(e => console.error("Audit fail:", e));
 }
 
-// ---------- Main Server ----------
-serve(async (req: Request) => {
+async function checkRateLimit(ip: string, limit: number, windowSec: number): Promise<boolean> {
+  const key = ["rate", ip];
+  const res = await kv.get<number>(key);
+  const count = res.value ?? 0;
+  if (count >= limit) return false;
+  const r = await kv.atomic().check(res).set(key, count + 1, { expireIn: windowSec * 1000 }).commit();
+  if (!r.ok) console.warn("Rate limit atomic fail", ip);
+  return true;
+}
+
+async function tryLockTask(taskId: number): Promise<boolean> {
+  const key = ["task_lock", taskId];
+  const res = await kv.get<number>(key);
+  if (res.value) return false;
+  const r = await kv.atomic().check(res).set(key, 1, { expireIn: 120_000 }).commit();
+  return r.ok;
+}
+async function unlockTask(taskId: number) { await kv.delete(["task_lock", taskId]); }
+
+// ---------- QStash Signature Verification ----------
+async function verifyQStashSignature(req: Request): Promise<boolean> {
+  if (!QSTASH_SIGNING_SECRET) return false;
+  const signature = req.headers.get("upstash-signature");
+  if (!signature) return false;
+  const bodyText = await req.clone().text();
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw", enc.encode(QSTASH_SIGNING_SECRET),
+    { name: "HMAC", hash: "SHA-256" }, false, ["verify"]
+  );
+  const sigBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
+  return await crypto.subtle.verify("HMAC", key, sigBytes, enc.encode(bodyText));
+}
+
+// ---------- CORS helper ----------
+function isOriginAllowed(origin: string): boolean {
+  if (ALLOWED_ORIGINS === "*") return true;
+  const allowed = ALLOWED_ORIGINS.split(",").map(o => o.trim());
+  return allowed.includes(origin);
+}
+
+// ---------- DB query with timeout ----------
+async function dbQueryWithTimeout(sql: string, args: any[], timeoutMs = 5000) {
+  const queryPromise = db.execute({ sql, args });
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error("Database timeout")), timeoutMs)
+  );
+  return Promise.race([queryPromise, timeoutPromise]) as ReturnType<typeof db.execute>;
+}
+
+// ---------- Request Handler ----------
+async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
+  const ip = req.headers.get("x-forwarded-for") || "127.0.0.1";
+  const correlationId = req.headers.get("x-correlation-id") || crypto.randomUUID();
   const origin = req.headers.get("origin") || "";
 
-  // OPTIONS (CORS Preflight)
-  if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders(origin) });
+  const headers = new Headers();
+  headers.set("Access-Control-Allow-Origin", isOriginAllowed(origin) ? origin : "");
+  headers.set("Access-Control-Allow-Headers",
+    "x-admin-key, content-type, x-correlation-id, authorization, x-user-id, upstash-signature");
+  headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("X-Correlation-ID", correlationId);
+
+  if (req.method === "OPTIONS") return new Response(null, { headers });
+
+  // ---------- PUBLIC: Root ----------
+  if (url.pathname === "/" && req.method === "GET") {
+    return new Response("✅ MCQ Platform API is Live!", { status: 200, headers });
   }
 
-  // ---------- PUBLIC: Health Check ----------
-  if (url.pathname === "/api/health" && req.method === "GET") {
-    return new Response(JSON.stringify({ status: "ok", timestamp: Date.now() }), {
-      status: 200,
-      headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
-    });
+  // ---------- PUBLIC: Health ----------
+  if (url.pathname === "/api/health") {
+    return new Response(JSON.stringify({ status: "ok", timestamp: Date.now() }), { headers });
   }
 
-  // ---------- PUBLIC: Get MCQs (Frontend) ----------
-  if (url.pathname === "/api/mcqs" && req.method === "POST") {
+  // ---------- PUBLIC: Get Bundle (Frontend uses this) ----------
+  if (url.pathname.startsWith("/api/bundle/") && req.method === "GET") {
+    const chapter = decodeURIComponent(url.pathname.replace("/api/bundle/", "")).toLowerCase();
     try {
-      const { chapter } = await req.json();
-      if (!chapter) {
-        return new Response(JSON.stringify({ error: "Chapter required" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
-        });
+      const result = await dbQueryWithTimeout(
+        "SELECT data FROM bundles WHERE chapter = ? ORDER BY version DESC LIMIT 1",
+        [chapter]
+      );
+      if (result.rows.length === 0) {
+        return new Response(JSON.stringify({ error: "Bundle not found" }), { status: 404, headers });
       }
-      const data = await getMCQs(chapter);
-      return new Response(JSON.stringify(data), {
-        status: 200,
-        headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
-      });
-    } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 500,
-        headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
-      });
+      const data = result.rows[0].data as ArrayBuffer;
+      const respHeaders = new Headers(headers);
+      respHeaders.set("Content-Type", "application/json");
+      respHeaders.set("Content-Encoding", "gzip");
+      respHeaders.set("Cache-Control", "no-store");
+      return new Response(data, { headers: respHeaders });
+    } catch (e) {
+      console.error("Bundle fetch error:", e);
+      return new Response(JSON.stringify({ error: "Bundle unavailable" }), { status: 500, headers });
     }
+  }
+
+  // ---------- PUBLIC: Get Session Token ----------
+  if (url.pathname === "/api/session-token" && req.method === "POST") {
+    if (!(await checkRateLimit(ip, 5, 60))) {
+      return new Response(JSON.stringify({ error: "Too many token requests" }), { status: 429, headers });
+    }
+    let body: any = {};
+    try { body = await req.json().catch(() => ({})); } catch { /* ignore */ }
+    const userId = body.userId || "anon_" + crypto.randomUUID().slice(0, 8);
+    const token = await createSessionToken(userId, JWT_SECRET);
+    const sessionId = atob(token).split(':')[2];
+    await kv.set(["session", sessionId], { userId, submitted: false }, { expireIn: 30 * 60 * 1000 });
+    return new Response(JSON.stringify({ token, userId }), { headers });
   }
 
   // ---------- ADMIN: Generate MCQs (Cron / Manual) ----------
   if (url.pathname === "/api/admin/generate" && req.method === "POST") {
-    const key = req.headers.get("x-admin-key");
-    if (key !== ADMIN_KEY) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
-      });
+    const adminKey = req.headers.get("x-admin-key") || "";
+    if (adminKey !== ADMIN_KEY) {
+      const qstashValid = await verifyQStashSignature(req);
+      if (!qstashValid) {
+        await logAudit("ADMIN_GENERATE_UNAUTHORIZED", ip);
+        return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 403, headers });
+      }
     }
     try {
-      const result = await generateMCQs();
-      return new Response(JSON.stringify({ success: true, result }), {
-        status: 200,
-        headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
+      const { rows: tasks } = await dbQueryWithTimeout(
+        `SELECT * FROM generation_tasks WHERE status = 'pending' AND generated_count < target_count ORDER BY created_at ASC LIMIT 1`,
+        []
+      );
+      if (tasks.length === 0) {
+        return new Response(JSON.stringify({ message: "No pending tasks" }), { headers });
+      }
+      const task = tasks[0];
+      if (!(await tryLockTask(task.id))) {
+        return new Response(JSON.stringify({ message: "Task already being processed" }), { headers });
+      }
+      await db.execute({
+        sql: "UPDATE generation_tasks SET status = 'in_progress', updated_at = ? WHERE id = ?",
+        args: [Date.now(), task.id],
       });
-    } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 500,
-        headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
+      const batchSize = Math.min(100, task.target_count - task.generated_count);
+      let generated = 0;
+      try {
+        generated = await generateAndStoreMCQs(task.subject, task.chapter, batchSize);
+      } catch (err) {
+        await db.execute({
+          sql: `UPDATE generation_tasks SET status = 'pending', retry_count = retry_count + 1, last_error = ?, updated_at = ? WHERE id = ?`,
+          args: [err.message, Date.now(), task.id],
+        });
+        await unlockTask(task.id);
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers });
+      }
+      const newCount = task.generated_count + generated;
+      const newStatus = newCount >= task.target_count ? "completed" : "pending";
+      await db.execute({
+        sql: "UPDATE generation_tasks SET generated_count = ?, status = ?, updated_at = ? WHERE id = ?",
+        args: [newCount, newStatus, Date.now(), task.id],
       });
+      await unlockTask(task.id);
+      console.log(JSON.stringify({ event: "generation_complete", taskId: task.id, generated }));
+      return new Response(JSON.stringify({ success: true, task_id: task.id, generated }), { headers });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: e.message }), { status: 500, headers });
     }
   }
 
-  // ---------- 🆕 ADMIN: Build Bundles (Manual Trigger) ----------
+  // ---------- 🆕 NEW: ADMIN: Manually Trigger Build Bundles ----------
   if (url.pathname === "/api/admin/build-bundles" && req.method === "POST") {
-    const key = req.headers.get("x-admin-key");
-    if (key !== ADMIN_KEY) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
-      });
+    const adminKey = req.headers.get("x-admin-key") || "";
+    if (adminKey !== ADMIN_KEY) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 403, headers });
     }
     try {
-      console.log("🚀 Manual bundle build triggered...");
+      console.log("🚀 Manual bundle build triggered by admin...");
       await buildBundles();
-      return new Response(JSON.stringify({ success: true, message: "Bundles built successfully!" }), {
-        status: 200,
-        headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
-      });
+      return new Response(JSON.stringify({ success: true, message: "Bundles built successfully!" }), { status: 200, headers });
     } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 500,
-        headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
-      });
+      console.error("Build bundles error:", err);
+      return new Response(JSON.stringify({ error: err.message }), { status: 500, headers });
     }
   }
 
-  // ---------- 404 ----------
-  return new Response(JSON.stringify({ error: "Not found" }), {
-    status: 404,
-    headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
-  });
+  // ---------- ADMIN: Cleanup audit logs ----------
+  if (url.pathname === "/api/admin/cleanup-audit" && req.method === "POST") {
+    const adminKey = req.headers.get("x-admin-key") || "";
+    if (adminKey !== ADMIN_KEY) {
+      const qstashValid = await verifyQStashSignature(req);
+      if (!qstashValid) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 403, headers });
+      }
+    }
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    await db.execute({
+      sql: "DELETE FROM audit_log WHERE timestamp < ?",
+      args: [cutoff],
+    });
+    return new Response(JSON.stringify({ success: true, message: "Audit logs cleaned" }), { headers });
+  }
+
+  return new Response("Not Found", { status: 404, headers });
+}
+
+// ✅ Auto-Scheduler (Every 5 Minutes) - Fixes "error sending request"
+Deno.cron("Auto MCQ Gen", "*/5 * * * *", async () => {
+  console.log("⏰ Auto Cron triggered internally...");
+  try {
+    const fakeReq = new Request("https://mcq-platform-80.rameshxcb-stack.deno.dev/api/admin/generate", {
+      method: "POST",
+      headers: { "x-admin-key": "mcq_admin_secure_key_2026_x9k2m4n8" }
+    });
+    const response = await handleRequest(fakeReq);
+    const data = await response.json();
+    console.log("✅ Auto-gen result:", data);
+  } catch (e) {
+    console.error("❌ Auto-gen error:", e.message);
+  }
 });
+
+// 🔥 Deno.serve se server start (No extra port config needed)
+Deno.serve(handleRequest);
