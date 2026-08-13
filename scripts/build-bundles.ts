@@ -39,7 +39,6 @@ export async function buildBundles() {
     const checksum = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(json))
       .then(hashBuffer => Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join(''));
 
-    // ✅ Correctly update the bundles table (uses conflict handling and versioning)
     await db.execute({
       sql: `INSERT INTO bundles (chapter, version, data, checksum, created_at)
             VALUES (?, (SELECT COALESCE(MAX(version),0)+1 FROM bundles WHERE chapter = ?), ?, ?, ?)
@@ -60,5 +59,5 @@ if (import.meta.main) {
   await buildBundles();
 }
 
-// ✅ Ye export line zaroori hai taaki main.ts import kar sake agar zaroorat pade
+// ✅ यह Export बिल्कुल जरूरी है
 export { buildBundles };
