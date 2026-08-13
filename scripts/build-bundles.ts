@@ -50,5 +50,5 @@ if (import.meta.main) {
   await buildBundles();
 }
 
-// ✅ यह Export Line जरूर होनी चाहिए
+// ✅ यह Export Line जरूर होनी चाहिए – इसे हटाना मत!
 export { buildBundles };
