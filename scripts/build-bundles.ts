@@ -58,6 +58,3 @@ export async function buildBundles() {
 if (import.meta.main) {
   await buildBundles();
 }
-
-// ✅ यह Export बिल्कुल जरूरी है
-export { buildBundles };
